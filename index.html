@@ -1669,12 +1669,42 @@ class Liquen extends xb.Script {
 }
 
 /* =====================================================================
- * 7. ARRANQUE
+ * 7. ARRANQUE (robusto en Meta Quest Browser)
  * ===================================================================== */
 const landing = document.getElementById('landing');
 const startBtn = document.getElementById('start');
-let xrSupported = false;
-try { xrSupported = !!(await navigator.xr?.isSessionSupported('immersive-vr')); } catch (e) { xrSupported = false; }
+
+/* --- Diagnóstico opcional: solo con ?debug en la URL (no añade texto en el modo normal) --- */
+const DEBUG = new URLSearchParams(location.search).has('debug');
+let debugBox = null;
+if (DEBUG) {
+  debugBox = document.createElement('pre');
+  debugBox.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:50;max-width:min(560px,90vw);max-height:45vh;overflow:auto;margin:0;padding:10px;background:rgba(0,0,0,.85);color:#9fe8c0;font:12px/1.4 monospace;white-space:pre-wrap;border:1px solid #2de2d0;border-radius:6px';
+  document.body.appendChild(debugBox);
+  for (const level of ['log', 'info', 'warn', 'error']) {
+    const orig = console[level].bind(console);
+    console[level] = (...args) => { orig(...args); dlog(level.toUpperCase(), ...args); };
+  }
+  window.addEventListener('error', (e) => dlog('ERROR', e.message));
+  window.addEventListener('unhandledrejection', (e) => dlog('PROMISE', e.reason?.name, e.reason?.message || e.reason));
+}
+function dlog(...args) {
+  if (!debugBox) return;
+  const txt = args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}` : typeof a === 'object' ? (() => { try { return JSON.stringify(a); } catch { return String(a); } })() : String(a))).join(' ');
+  debugBox.textContent += `${(performance.now() / 1000).toFixed(1)}s ${txt}\n`;
+  debugBox.scrollTop = debugBox.scrollHeight;
+}
+dlog('secureContext', window.isSecureContext, '| iframe', window.self !== window.top, '| navigator.xr', !!navigator.xr,
+  '| offerSession', !!navigator.xr?.offerSession, '| UA', navigator.userAgent);
+
+/* --- Evita la "sesión ofrecida" automática ---
+ * XR Blocks llama a navigator.xr.offerSession() al iniciarse si el navegador lo admite.
+ * En Quest Browser eso deja una solicitud de sesión pendiente que puede hacer fallar la
+ * solicitud del botón "Comienza tu viaje". Se oculta solo para esta página. */
+if (navigator.xr && navigator.xr.offerSession) {
+  try { Object.defineProperty(navigator.xr, 'offerSession', {value: undefined, configurable: true, writable: true}); dlog('offerSession desactivado'); }
+  catch (e) { dlog('No se pudo desactivar offerSession', e); }
+}
 
 const options = new xb.Options();
 options.enableVR();                              // sesión immersive-vr (no passthrough)
@@ -1685,28 +1715,43 @@ options.referenceSpaceType = 'local-floor';
 options.permissions.microphone = false;          // nunca se usa el micrófono
 
 class SessionHooks extends xb.Script {
-  onXRSessionStarted() { landing.classList.add('hidden'); app.begin(); }
-  onXRSessionEnded() { app.stop(); landing.classList.remove('hidden'); }
+  onXRSessionStarted() { dlog('Sesión XR iniciada'); starting = false; landing.classList.add('hidden'); app.begin(); }
+  onXRSessionEnded() { dlog('Sesión XR terminada'); starting = false; app.stop(); landing.classList.remove('hidden'); startBtn.disabled = false; }
 }
 const app = new Liquen();
 xb.add(app);
 xb.add(new SessionHooks());
-try { await xb.init(options); }
+try { await xb.init(options); dlog('XR Blocks listo'); }
 catch (e) { console.warn('[LIQUEN] Inicialización parcial (p. ej., recurso del simulador de escritorio):', e); }
 try { xb.core.renderer.xr.setFoveation?.(1); } catch (e) { /* opcional */ }
 
-await app.preload();
+const mgr = xb.core.webXRSessionManager;
+const xrSupported = !!mgr?.isXRSupported?.();
+dlog('immersive-vr soportado', xrSupported);
+
+// Si la solicitud de sesión falla, se registra el motivo y el botón queda listo para reintentar.
+let starting = false;
+mgr?.addEventListener?.('sessionerror', (e) => {
+  starting = false; startBtn.disabled = false;
+  console.warn('[LIQUEN] Error al iniciar la sesión XR:', e.error?.name, e.error?.message || e.error);
+});
+
+// El botón se activa en cuanto XR Blocks está listo; los recursos siguen cargando en segundo plano
+// (una narración que aún no haya cargado simplemente no suena; el cielo aparece cuando llega).
 startBtn.disabled = false;
+app.preload().then(() => dlog('Recursos cargados')).catch((e) => console.warn('[LIQUEN] Precarga incompleta', e));
 
 startBtn.addEventListener('click', () => {
-  app.audio.unlock();                            // gesto del usuario: habilita audio
-  if (xrSupported) {
-    try { xb.core.webXRSessionManager.startSession(); }
-    catch (e) { console.warn('[LIQUEN] No se pudo iniciar WebXR', e); }
-  } else {                                       // escritorio: simulador de XR Blocks
-    landing.classList.add('hidden');
-    app.begin();
+  if (starting) return;
+  // 1) Primero la sesión XR: requestSession debe ocurrir dentro del gesto del usuario.
+  if (xrSupported && mgr && !mgr.currentSession) {
+    try { starting = true; startBtn.disabled = true; mgr.startSession(); dlog('Solicitando sesión XR…'); }
+    catch (e) { starting = false; startBtn.disabled = false; console.warn('[LIQUEN] No se pudo iniciar WebXR:', e?.message || e); }
   }
+  // 2) Después el audio, protegido para que un error nunca bloquee la entrada.
+  try { app.audio.unlock(); } catch (e) { console.warn('[LIQUEN] Audio no disponible', e); }
+  // 3) Sin WebXR (escritorio): simulador de XR Blocks.
+  if (!xrSupported) { landing.classList.add('hidden'); app.begin(); }
 });
 </script>
 </body>
